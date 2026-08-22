@@ -1,0 +1,1 @@
+venv/  __pycache__/  *.pyc  *.gguf  models/  .DS_Store 
