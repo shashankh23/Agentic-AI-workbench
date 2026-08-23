@@ -3,6 +3,7 @@ from router.router import get_target_model
 from sandbox.sandbox import execute_python_code
 from docgen.docgen import generate_word_report
 from vision.vision import analyze_image
+from ledger.ledger import log_action
 
 def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3) -> str:
     """Generates code, runs it in the sandbox, and self-corrects on failure."""
@@ -24,6 +25,7 @@ def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3
         code = response['message']['content']
 
         result = execute_python_code(code)
+        log_action("sandbox_exec", model_used=model, details=f"Success: {result['success']}")
 
         if result["success"]:
             return (
@@ -53,6 +55,7 @@ def process_user_request(prompt: str, image_path: str = None, history: list = No
     
     # 1. Route to the right model
     model = get_target_model(prompt)
+    log_action("model_selection", model_used=model, details=f"Prompt: {prompt[:100]}")
     print(f"[Router] Selected model: {model}")
     
     # 2. Execute specific workflow based on the task
@@ -71,7 +74,9 @@ def process_user_request(prompt: str, image_path: str = None, history: list = No
 ])
         extracted_text = response['message']['content']
         # Step B: Save to Word
-        return generate_word_report(extracted_text)
+        result = generate_word_report(extracted_text)
+        log_action("file_write", model_used=model, details="Generated AI_Report.docx")
+        return result
         
     elif "code" in prompt.lower():
         print("[Agent] Initiating Code Generation & Sandbox Task (with self-correction)...")
