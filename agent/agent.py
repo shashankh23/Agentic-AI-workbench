@@ -4,8 +4,11 @@ from sandbox.sandbox import execute_python_code
 from docgen.docgen import generate_word_report
 from vision.vision import analyze_image
 from ledger.ledger import log_action
+from docgen.pdf_reader import extract_pdf_text
 
-def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3) -> str:
+def run_code_with_self_correction(model: str, prompt: str,history: list = None, max_attempts: int = 3) -> str:
+    if history is None:
+        history = []
     """Generates code, runs it in the sandbox, and self-corrects on failure."""
     
     current_prompt = prompt
@@ -20,6 +23,7 @@ def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3
         
         response = ollama.chat(model=model, messages=[
             {'role': 'system', 'content': system_msg},
+            *history,
             {'role': 'user', 'content': current_prompt}
         ])
         code = response['message']['content']
@@ -52,37 +56,45 @@ def process_user_request(prompt: str, image_path: str = None, history: list = No
         history = []
     history = history[-10:]
     print(f"\n--- Processing: {prompt} ---")
-    
+
     # 1. Route to the right model
     model = get_target_model(prompt)
     log_action("model_selection", model_used=model, details=f"Prompt: {prompt[:100]}")
     print(f"[Router] Selected model: {model}")
-    
+
     # 2. Execute specific workflow based on the task
     if "image" in prompt.lower() and image_path:
         print("[Agent] Initiating Vision Task...")
         result = analyze_image(prompt, image_path)
         return result
-        
+
     elif "report" in prompt.lower() or "document" in prompt.lower():
         print("[Agent] Initiating Extraction -> DocGen Task...")
-        # Step A: Get LLM to extract data
+
+        if image_path and image_path.endswith(".pdf"):
+            pdf_text, is_scanned = extract_pdf_text(image_path)
+            if is_scanned:
+                source_text = "Error: This appears to be a scanned PDF with no readable text. Scanned document support is not yet available for this task type."
+            else:
+                source_text = pdf_text
+        else:
+            source_text = prompt  # fallback: no PDF uploaded, just summarize typed text
+
         response = ollama.chat(model=model, messages=[
-        {'role': 'system', 'content': 'You are an extraction assistant. Summarize the user text into 3 key bullet points.'},
-        *history,
-        {'role': 'user', 'content': prompt}
-])
+            {'role': 'system', 'content': 'You are an extraction assistant. Summarize the document text into 3 key bullet points.'},
+            *history,
+            {'role': 'user', 'content': source_text}
+        ])
         extracted_text = response['message']['content']
-        # Step B: Save to Word
         result = generate_word_report(extracted_text)
         log_action("file_write", model_used=model, details="Generated AI_Report.docx")
         return result
-        
+
     elif "code" in prompt.lower():
         print("[Agent] Initiating Code Generation & Sandbox Task (with self-correction)...")
-        return run_code_with_self_correction(model, prompt)
-        
+        return run_code_with_self_correction(model, prompt, history=history)
+
     else:
         # Fallback to standard chat
-        response = ollama.chat(model=model, messages=[{'role': 'user', 'content': prompt}])
+        response = ollama.chat(model=model, messages=[*history, {'role': 'user', 'content': prompt}])
         return response['message']['content']
