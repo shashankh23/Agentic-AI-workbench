@@ -6,6 +6,65 @@ import uuid
 import glob
 import inspect
 import sqlite3
+import io
+import fitz  # PyMuPDF
+
+try:
+    import pytesseract
+    from PIL import Image
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+
+TEXT_EXTS = {".txt", ".md", ".csv"}
+MIN_CHARS_PER_PAGE = 40      # below this, the page is treated as scanned
+MAX_CHARS_PER_FILE = 12000   # keeps a 7B context from overflowing
+OCR_DPI = 200
+
+
+def _ocr_tesseract(pix) -> str:
+    return pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png"))))
+
+
+def _ocr_with_vlm(pix) -> str:
+    """Fallback OCR through the local vision model — still zero external calls."""
+    import base64, ollama
+    b64 = base64.b64encode(pix.tobytes("png")).decode()
+    r = ollama.chat(model="qwen2.5vl:7b", messages=[{
+        "role": "user",
+        "content": "Transcribe all text on this page verbatim. Output only the text.",
+        "images": [b64],
+    }])
+    return r["message"]["content"]
+
+
+def extract_pdf_text(path: str) -> str:
+    doc = fitz.open(path)
+    pages = []
+    for page in doc:
+        text = page.get_text().strip()
+        if len(text) < MIN_CHARS_PER_PAGE:          # scanned / image-only page
+            pix = page.get_pixmap(dpi=OCR_DPI)
+            try:
+                text = (_ocr_tesseract(pix) if HAS_TESSERACT else _ocr_with_vlm(pix)).strip()
+            except Exception as e:
+                text = f"[OCR failed on this page: {e}]"
+        pages.append(f"--- page {page.number + 1} ---\n{text}")
+    doc.close()
+    return "\n\n".join(pages)[:MAX_CHARS_PER_FILE]
+
+
+def extract_file_text(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".pdf":
+            return extract_pdf_text(path)
+        if ext in TEXT_EXTS:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()[:MAX_CHARS_PER_FILE]
+    except Exception as e:
+        return f"[Could not read this file: {e}]"
+    return ""
 
 from agent.agent import process_user_request
 from memory.memory import init_db, save_message, load_messages, clear_session
@@ -474,11 +533,33 @@ if submission:
 
     saved_paths = [save_upload(f) for f in attachments]
 
-    # process_user_request keeps its original signature: one file path.
-    image_path = next((p for p in saved_paths
-                       if os.path.splitext(p)[1].lower() in IMAGE_EXTS), None)
-    if image_path is None and saved_paths:
-        image_path = saved_paths[0]
+    image_paths = [p for p in saved_paths
+                   if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
+    doc_paths = [p for p in saved_paths if p not in image_paths]
+
+    # Read every non-image attachment here and inline it into the prompt,
+    # so the text actually reaches the model.
+    context_blocks = []
+    for p in doc_paths:
+        text = extract_file_text(p).strip()
+        context_blocks.append(
+            f"### Attached file: {os.path.basename(p)}\n"
+            + (text or "[No text could be extracted from this file, even with OCR.]")
+        )
+
+    agent_prompt = prompt_text
+    if context_blocks:
+        agent_prompt = (
+            "Use ONLY the attached file contents below to answer.\n\n"
+            + "\n\n".join(context_blocks)
+            + f"\n\n### User question\n{prompt_text or 'Summarise the attached file.'}"
+        )
+
+    # Only real images go to the vision model — and agent.py's branch needs
+    # the literal word "image" in the prompt before it will fire.
+    image_path = image_paths[0] if image_paths else None
+    if image_path and "image" not in agent_prompt.lower():
+        agent_prompt = f"Analyse the attached image. {agent_prompt}".strip()   
 
     user_content = prompt_text
     if saved_paths:
@@ -491,7 +572,7 @@ if submission:
 
         with st.spinner("Processing local AI task..."):
             response = process_user_request(
-                prompt=prompt_text,
+                prompt=agent_prompt,
                 image_path=image_path,
                 history=st.session_state.messages,
             )
