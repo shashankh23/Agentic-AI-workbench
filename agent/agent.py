@@ -27,10 +27,10 @@ def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3
 
         if result["success"]:
             return (
-                f"[Succeeded on attempt {attempt}]\n\n"
-                f"Code:\n{result['code_used']}\n\n"
-                f"Output:\n{result['output']}"
-            )
+          f"[Succeeded on attempt {attempt}]\n\n"
+          f"**Code:**\n```python\n{result['code_used']}\n```\n\n"
+          f"**Output:**\n```\n{result['output']}\n```"
+         )
 
         # Failed — build a correction prompt for the next attempt
         print(f"[Agent] Attempt {attempt} failed: {result['output'][:200]}")
@@ -41,11 +41,14 @@ def run_code_with_self_correction(model: str, prompt: str, max_attempts: int = 3
         )
 
     return (
-        f"[Failed after {max_attempts} attempts]\n\n"
-        f"Last error:\n{result['output']}"
-    )
+     f"[Failed after {max_attempts} attempts]\n\n"
+     f"**Last error:**\n```\n{result['output']}\n```"
+     )
 
-def process_user_request(prompt: str, image_path: str = None):
+def process_user_request(prompt: str, image_path: str = None, history: list = None):
+    if history is None:
+        history = []
+    history = history[-10:]
     print(f"\n--- Processing: {prompt} ---")
     
     # 1. Route to the right model
@@ -62,9 +65,10 @@ def process_user_request(prompt: str, image_path: str = None):
         print("[Agent] Initiating Extraction -> DocGen Task...")
         # Step A: Get LLM to extract data
         response = ollama.chat(model=model, messages=[
-            {'role': 'system', 'content': 'You are an extraction assistant. Summarize the user text into 3 key bullet points.'},
-            {'role': 'user', 'content': prompt}
-        ])
+        {'role': 'system', 'content': 'You are an extraction assistant. Summarize the user text into 3 key bullet points.'},
+        *history,
+        {'role': 'user', 'content': prompt}
+])
         extracted_text = response['message']['content']
         # Step B: Save to Word
         return generate_word_report(extracted_text)
