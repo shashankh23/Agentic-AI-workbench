@@ -5,6 +5,8 @@ from docgen.docgen import generate_word_report
 from vision.vision import analyze_image
 from ledger.ledger import log_action
 from docgen.pdf_reader import extract_pdf_text
+from docgen.table_extractor import extract_tables_from_pdf
+from vision.document_processor import process_document_image
 
 def run_code_with_self_correction(model: str, prompt: str,history: list = None, max_attempts: int = 3) -> str:
     if history is None:
@@ -69,26 +71,45 @@ def process_user_request(prompt: str, image_path: str = None, history: list = No
         return result
 
     elif "report" in prompt.lower() or "document" in prompt.lower():
-        print("[Agent] Initiating Extraction -> DocGen Task...")
+     print("[Agent] Initiating Extraction -> DocGen Task...")
 
-        if image_path and image_path.endswith(".pdf"):
-            pdf_text, is_scanned = extract_pdf_text(image_path)
-            if is_scanned:
-                source_text = "Error: This appears to be a scanned PDF with no readable text. Scanned document support is not yet available for this task type."
-            else:
-                source_text = pdf_text
+    if image_path and image_path.endswith(".pdf"):
+        pdf_text, is_scanned = extract_pdf_text(image_path)
+        
+        if is_scanned:
+            # Convert PDF pages to images, then run OCR + confidence escalation
+            from pdf2image import convert_from_path
+            pages = convert_from_path(image_path)
+            page_texts = []
+            for i, page_img in enumerate(pages):
+                temp_page_path = f"temp_page_{i}.png"
+                page_img.save(temp_page_path)
+                result = process_document_image(temp_page_path)
+                page_texts.append(result["full_text"])
+                os.remove(temp_page_path)
+            source_text = "\n\n".join(page_texts)
         else:
-            source_text = prompt  # fallback: no PDF uploaded, just summarize typed text
+            source_text = pdf_text
+            tables = extract_tables_from_pdf(image_path)
+            if tables:
+                source_text += "\n\n" + "\n\n".join(tables)
+    
+    elif image_path and image_path.endswith((".png", ".jpg", ".jpeg")):
+        result = process_document_image(image_path)
+        source_text = result["full_text"]
+    
+    else:
+        source_text = prompt
 
-        response = ollama.chat(model=model, messages=[
-            {'role': 'system', 'content': 'You are an extraction assistant. Summarize the document text into 3 key bullet points.'},
-            *history,
-            {'role': 'user', 'content': source_text}
-        ])
-        extracted_text = response['message']['content']
-        result = generate_word_report(extracted_text)
-        log_action("file_write", model_used=model, details="Generated AI_Report.docx")
-        return result
+    response = ollama.chat(model=model, messages=[
+        {'role': 'system', 'content': 'You are an extraction assistant. Summarize the document text into 3 key bullet points.'},
+        *history,
+        {'role': 'user', 'content': source_text}
+    ])
+    extracted_text = response['message']['content']
+    result = generate_word_report(extracted_text)
+    log_action("file_write", model_used=model, details="Generated AI_Report.docx")
+    return result
 
     elif "code" in prompt.lower():
         print("[Agent] Initiating Code Generation & Sandbox Task (with self-correction)...")
