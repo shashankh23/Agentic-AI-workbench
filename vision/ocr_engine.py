@@ -1,18 +1,26 @@
 from paddleocr import PaddleOCR
+import logging
 
-# Initialize once, reused across calls (loading the model repeatedly is slow)
+# Suppress verbose paddle logging cleanly
+logging.getLogger("ppocr").setLevel(logging.ERROR)
+
 _ocr_engine = None
 
 def get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
-        _ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        try:
+            # Modern PaddleOCR initialization
+            _ocr_engine = PaddleOCR(use_angle_cls=True, lang='en')
+        except TypeError:
+            # Fallback for older parameter variants
+            _ocr_engine = PaddleOCR(lang='en')
     return _ocr_engine
 
 def run_ocr(image_path: str) -> list:
     """
-    Runs PaddleOCR on an image. Returns a list of blocks:
-    [{"text": str, "confidence": float, "bbox": [[x,y],...]}]
+    Runs PaddleOCR on an image.
+    Returns: [{"text": str, "confidence": float, "bbox": [[x,y],...]}]
     """
     engine = get_ocr_engine()
     result = engine.ocr(image_path, cls=True)
@@ -23,7 +31,7 @@ def run_ocr(image_path: str) -> list:
             bbox, (text, confidence) = line
             blocks.append({
                 "text": text,
-                "confidence": confidence,  # 0.0 to 1.0
+                "confidence": float(confidence),  # Normalizes 0.0 - 1.0 scale
                 "bbox": bbox
             })
     return blocks
