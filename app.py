@@ -1,5 +1,3 @@
-import streamlit as st
-
 import os
 import re
 import uuid
@@ -8,7 +6,33 @@ import inspect
 import sqlite3
 import io
 import fitz  # PyMuPDF
+import streamlit as st
 
+from agent.agent import process_user_request
+from memory.memory import init_db, save_message, load_messages, clear_session
+from network.network_monitor import get_network_snapshot
+from ledger.ledger import verify_chain
+import memory.memory as _mem  # defensive feature detection
+
+# ---------------------------------------------------------------------------
+# Role Definitions & Sidebar Persona Settings
+# ---------------------------------------------------------------------------
+ROLE_PROMPTS = {
+    "Engineer": "Summarize with full technical detail, including all figures, parameters, and precise specifications.",
+    "Plant Manager": "Summarize in 3 concise bullet points suitable for an executive management briefing, focusing on key takeaways and avoiding deep technical jargon.",
+    "Safety Officer": "Summarize with primary emphasis on safety protocols, regulatory compliance risks, and any procedural deviations."
+}
+
+st.sidebar.title("Operational Settings")
+selected_role = st.sidebar.selectbox(
+    "Choose your operational persona:",
+    options=list(ROLE_PROMPTS.keys())
+)
+current_role_prompt = ROLE_PROMPTS[selected_role]
+
+# ---------------------------------------------------------------------------
+# OCR & File Extraction Setup
+# ---------------------------------------------------------------------------
 try:
     import pytesseract
     from PIL import Image
@@ -66,18 +90,11 @@ def extract_file_text(path: str) -> str:
         return f"[Could not read this file: {e}]"
     return ""
 
-from agent.agent import process_user_request
-from memory.memory import init_db, save_message, load_messages, clear_session
-from network.network_monitor import get_network_snapshot
-from ledger.ledger import verify_chain
-
-import memory.memory as _mem  # only for optional/defensive feature detection
-
 # ---------------------------------------------------------------------------
-# Constants
+# Constants & App Config
 # ---------------------------------------------------------------------------
 UPLOAD_DIR = "uploads"
-ATTACH_PREFIX = "\U0001F4CE "  # "📎 " marker used to embed attachment paths in a message
+ATTACH_PREFIX = "📎 "  # marker used to embed attachment paths in a message
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 ALLOWED_TYPES = ["png", "jpg", "jpeg", "pdf", "txt", "md", "csv"]
 
@@ -86,7 +103,7 @@ SUPPORTS_INLINE_FILES = "accept_file" in inspect.signature(st.chat_input).parame
 
 
 # ---------------------------------------------------------------------------
-# Helpers (pure app-layer -- no other module is modified)
+# Helpers
 # ---------------------------------------------------------------------------
 def format_latex(text: str) -> str:
     """Converts \\[ ... \\] and \\( ... \\) LaTeX delimiters to Streamlit-compatible $$ $$ and $ $."""
@@ -135,8 +152,7 @@ def plain_text(content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Session discovery: try memory.memory first, fall back to read-only SQLite.
-# Nothing in memory/memory.py has to change either way.
+# Session Discovery Helpers
 # ---------------------------------------------------------------------------
 def _normalize_sessions(raw):
     out = []
@@ -211,7 +227,7 @@ def _find_message_table(conn):
         content = next((c for c in cols if c.lower() in ("content", "message", "text", "body")), None)
         if role and content:
             ts = next((c for c in cols if c.lower() in
-                       ("timestamp", "created_at", "ts", "time", "created")), None)
+                        ("timestamp", "created_at", "ts", "time", "created")), None)
             return table, cols[lower.index("session_id")], role, content, ts
     return None
 
@@ -354,7 +370,7 @@ def start_new_chat():
 
 
 # ---------------------------------------------------------------------------
-# Page setup
+# Page Setup & Initialization
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Sovereign AI Workbench", layout="wide")
 
@@ -393,14 +409,14 @@ if "pending_files" not in st.session_state:
     st.session_state.pending_files = []
 
 # ---------------------------------------------------------------------------
-# Sidebar — new chat, keyword search, history, audit
+# Sidebar — New Chat, Keyword Search, History, Audit
 # ---------------------------------------------------------------------------
 with st.sidebar:
     if st.button("➕ New chat", use_container_width=True):
         start_new_chat()
         st.rerun()
 
-    # -- Find by keyword. Nothing is listed until a keyword is typed. ---------
+    # -- Find by keyword -----------------------------------------------------
     st.markdown('<p class="sidebar-heading">🔍 Find by keyword</p>', unsafe_allow_html=True)
     keyword = st.text_input("Find by keyword", placeholder="Type a keyword…",
                             label_visibility="collapsed", key="keyword_search")
@@ -486,7 +502,7 @@ with st.sidebar:
         st.rerun()
 
 # ---------------------------------------------------------------------------
-# Main area — chat only
+# Main Area — Chat Messages
 # ---------------------------------------------------------------------------
 st.markdown('<p class="main-title">🛡️ Sovereign AI Workbench</p>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">Secure, air-gapped agentic AI for industrial workflows — zero external calls.</p>',
@@ -512,7 +528,7 @@ if not SUPPORTS_INLINE_FILES:
             st.caption("Attached: " + ", ".join(f.name for f in staged))
 
 # ---------------------------------------------------------------------------
-# Unified message bar (text + attachments)
+# Input Processing & Agent Execution
 # ---------------------------------------------------------------------------
 if SUPPORTS_INLINE_FILES:
     submission = st.chat_input(
@@ -537,8 +553,7 @@ if submission:
                    if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
     doc_paths = [p for p in saved_paths if p not in image_paths]
 
-    # Read every non-image attachment here and inline it into the prompt,
-    # so the text actually reaches the model.
+    # Read non-image attachments and inline into prompt
     context_blocks = []
     for p in doc_paths:
         text = extract_file_text(p).strip()
@@ -555,29 +570,34 @@ if submission:
             + f"\n\n### User question\n{prompt_text or 'Summarise the attached file.'}"
         )
 
-    # Only real images go to the vision model — and agent.py's branch needs
-    # the literal word "image" in the prompt before it will fire.
+    # Trigger image branch if image is present
     image_path = image_paths[0] if image_paths else None
     if image_path and "image" not in agent_prompt.lower():
-        agent_prompt = f"Analyse the attached image. {agent_prompt}".strip()   
+        agent_prompt = f"Analyse the attached image. {agent_prompt}".strip()
 
     user_content = prompt_text
     if saved_paths:
         attach_block = "\n".join(f"{ATTACH_PREFIX}{p}" for p in saved_paths)
         user_content = (user_content + "\n\n" + attach_block).strip()
 
+    # Save User Message & Trigger Stream Generator
     if user_content:
         st.session_state.messages.append({"role": "user", "content": user_content})
         save_message(st.session_state.session_id, "user", user_content)
 
-        with st.spinner("Processing local AI task..."):
-            response = process_user_request(
-                prompt=agent_prompt,
+        with st.chat_message("assistant"):
+            response_generator = process_user_request(
+                agent_prompt,
                 image_path=image_path,
                 history=st.session_state.messages,
+                role_instruction=current_role_prompt,
             )
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        save_message(st.session_state.session_id, "assistant", response)
+            full_response = st.write_stream(response_generator)
+
+        # Save Assistant Response & Refresh Page
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        save_message(st.session_state.session_id, "assistant", full_response)
         st.session_state.pending_files = []
+
         st.rerun()

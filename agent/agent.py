@@ -8,7 +8,16 @@ from ledger.ledger import log_action
 from docgen.pdf_reader import extract_pdf_text
 from docgen.table_extractor import extract_tables_from_pdf
 from vision.document_processor import process_document_image
-from memory.cache import check_cache, store_cache
+
+# Safe import for memory cache with fallback stubs
+try:
+    from memory.cache import check_cache, store_cache
+except ImportError:
+    def check_cache(prompt: str):
+        return None, 0.0
+
+    def store_cache(prompt: str, response: str, model: str):
+        pass
 
 
 def stream_chat_response(model: str, messages: list):
@@ -66,16 +75,17 @@ def process_user_request(
     prompt: str, 
     image_path: str = None, 
     preloaded_text: str = None, 
-    history: list = None
+    history: list = None,
+    role_instruction: str = ""
 ):
     """
     Generator-based dispatcher supporting streaming tokens, semantic caching, 
-    multimodal OCR, and document-level provenance linkage.
+    multimodal OCR, and document-level provenance linkage with role-based prompt tuning.
     """
     if history is None:
         history = []
     history = history[-10:]
-    print(f"\n--- Processing: {prompt} ---")
+    print(f"\n--- Processing: {prompt} [Role Instruction Active] ---")
 
     # 1. Semantic Cache Check
     if not image_path and not preloaded_text and not any(w in prompt.lower() for w in ["code", "report", "document", "python"]):
@@ -129,8 +139,11 @@ def process_user_request(
         else:
             source_text = prompt
 
+        # Inject role instruction into extraction/summarization prompt
+        sys_content = f"You are an expert industrial extraction assistant. {role_instruction}" if role_instruction else "You are an extraction assistant. Summarize into 3 structured bullet points."
+
         response = ollama.chat(model=model, messages=[
-            {'role': 'system', 'content': 'You are an extraction assistant. Summarize into 3 structured bullet points.'},
+            {'role': 'system', 'content': sys_content},
             *history,
             {'role': 'user', 'content': source_text}
         ])
@@ -159,9 +172,14 @@ def process_user_request(
         yield result + f"\n\n---\n`Environment: Subprocess Sandbox` | `Audit Hash: {ledger_hash[:12]}`"
         return
 
-    # 6. Standard Conversational Stream
+    # 6. Standard Conversational Stream with Role Injection
     else:
-        messages = [*history, {'role': 'user', 'content': prompt}]
+        system_content = f"You are an expert industrial AI assistant. {role_instruction}" if role_instruction else "You are a helpful industrial AI assistant."
+        messages = [
+            {'role': 'system', 'content': system_content},
+            *history, 
+            {'role': 'user', 'content': prompt}
+        ]
         full_response = ""
         for chunk in stream_chat_response(model, messages):
             full_response += chunk
