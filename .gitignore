@@ -3,3 +3,8 @@
 *.db 
 uploads/ 
 venv/ 
+ledger/*.jsonl
+*.jsonl
+*.db
+temp_*
+ocr_crops/
