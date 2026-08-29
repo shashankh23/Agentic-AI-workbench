@@ -5,7 +5,7 @@ import glob
 import inspect
 import sqlite3
 import io
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 import streamlit as st
 
 from agent.agent import process_user_request
@@ -106,9 +106,39 @@ SUPPORTS_INLINE_FILES = "accept_file" in inspect.signature(st.chat_input).parame
 # Helpers
 # ---------------------------------------------------------------------------
 def format_latex(text: str) -> str:
-    """Converts \\[ ... \\] and \\( ... \\) LaTeX delimiters to Streamlit-compatible $$ $$ and $ $."""
-    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text, flags=re.DOTALL)
-    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text, flags=re.DOTALL)
+    """
+    Cleans and standardizes LaTeX formulas for Streamlit markdown:
+    - Normalizes bracket notation (\\[ \\], \\( \\)) to $$ / $
+    - Fixes malformed multi-dollar issues (e.g., $$$ or nested $ inside $$)
+    """
+    if not text:
+        return ""
+
+    # 1. Normalize escaped brackets to standard LaTeX brackets
+    text = text.replace(r'\\\[', r'\[').replace(r'\\\]', r'\]')
+    text = text.replace(r'\\\(', r'\(').replace(r'\\\)', r'\)')
+
+    # 2. Replace block brackets \[ ... \] with $$ ... $$
+    text = re.sub(r'\\\[\s*(.*?)\s*\\\]', r'$$\1$$', text, flags=re.DOTALL)
+
+    # 3. Replace inline brackets \( ... \) with $ ... $
+    text = re.sub(r'\\\(\s*(.*?)\s*\\\)', r'$\1$', text, flags=re.DOTALL)
+
+    # 4. Handle raw brackets wrapping LaTeX commands: [ \command ... ]
+    text = re.sub(r'\[\s*(\\[a-zA-Z_].*?)\s*\]', r'$$\1$$', text, flags=re.DOTALL)
+
+    # 5. Fix nested single dollars inside double dollar blocks: $$ ... $var$ ... $$ -> $$ ... var ... $$
+    def clean_nested_dollars(match):
+        inner = match.group(1)
+        # Remove any internal single '$' that cause delimiter mismatch
+        cleaned_inner = inner.replace('$', '')
+        return f"$${cleaned_inner}$$"
+
+    text = re.sub(r'\$\$(.*?)\$\$', clean_nested_dollars, text, flags=re.DOTALL)
+
+    # 6. Collapse any accidental 3+ consecutive dollar signs to 2
+    text = re.sub(r'\${3,}', '$$', text)
+
     return text
 
 
@@ -138,6 +168,7 @@ def render_message(content: str):
     """Render one chat message, previewing any attachments it carries."""
     body, paths = split_attachments(content)
     if body:
+        # Run formatting here at display time
         st.markdown(format_latex(body))
     for path in paths:
         ext = os.path.splitext(path)[1].lower()
@@ -553,7 +584,7 @@ if submission:
                    if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
     doc_paths = [p for p in saved_paths if p not in image_paths]
 
-    # Read non-image attachments and inline into prompt
+    # Pre-extract file context safely
     context_blocks = []
     for p in doc_paths:
         text = extract_file_text(p).strip()
@@ -562,15 +593,11 @@ if submission:
             + (text or "[No text could be extracted from this file, even with OCR.]")
         )
 
+    # Initialize the variable cleanly
+    preloaded_extracted_text = "\n\n".join(context_blocks) if context_blocks else None
     agent_prompt = prompt_text
-    if context_blocks:
-        agent_prompt = (
-            "Use ONLY the attached file contents below to answer.\n\n"
-            + "\n\n".join(context_blocks)
-            + f"\n\n### User question\n{prompt_text or 'Summarise the attached file.'}"
-        )
 
-    # Trigger image branch if image is present
+    # Route vision if an image is provided
     image_path = image_paths[0] if image_paths else None
     if image_path and "image" not in agent_prompt.lower():
         agent_prompt = f"Analyse the attached image. {agent_prompt}".strip()
@@ -580,24 +607,28 @@ if submission:
         attach_block = "\n".join(f"{ATTACH_PREFIX}{p}" for p in saved_paths)
         user_content = (user_content + "\n\n" + attach_block).strip()
 
-    # Save User Message & Trigger Stream Generator
     if user_content:
+        # Display and record user message
         st.session_state.messages.append({"role": "user", "content": user_content})
         save_message(st.session_state.session_id, "user", user_content)
+        
+        with st.chat_message("user"):
+            render_message(user_content)
 
+        # Stream response token by token
+        # Stream response token by token
         with st.chat_message("assistant"):
             response_generator = process_user_request(
-                agent_prompt,
+                prompt=agent_prompt,
                 image_path=image_path,
-                history=st.session_state.messages,
-                role_instruction=current_role_prompt,
+                preloaded_text=preloaded_extracted_text,
+                history=st.session_state.messages[:-1],
             )
+            raw_response = st.write_stream(response_generator)
 
-            full_response = st.write_stream(response_generator)
-
-        # Save Assistant Response & Refresh Page
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-        save_message(st.session_state.session_id, "assistant", full_response)
+        # Save the raw response directly (render_message will format it on rerun)
+        st.session_state.messages.append({"role": "assistant", "content": raw_response})
+        save_message(st.session_state.session_id, "assistant", raw_response)
+        
         st.session_state.pending_files = []
-
         st.rerun()
